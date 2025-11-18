@@ -1,7 +1,5 @@
 # CS336
 
-[TOC]
-
 ## Basics
 
 **Goal**: get a basic version of the full pipeline working
@@ -40,7 +38,7 @@ data不一定越多越好，有效的data才是
 
 ## Systems
 
-**Goal: **squeeze the most out of the hardware 
+**Goal:** squeeze the most out of the hardware 
 
 **Components:** kernels, parallelism, inference
 
