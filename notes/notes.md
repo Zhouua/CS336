@@ -86,6 +86,12 @@ Inference分为两部分：prefill和decode
 
 Goal: do experiments **at small scale**, predict hyperparameters/loss at large scale
 
+### <a href="../assignment3-scaling">Assignment</a>
+
 ## Data
 
+### <a href="../assignment4-data">Assignment</a>
+
 ## Alignment
+
+### <a herf="../assignment5-alignment">Assignment</a>
