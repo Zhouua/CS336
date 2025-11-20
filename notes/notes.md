@@ -82,11 +82,189 @@ GPT2首先用word-based tokenization来分割，然后在分割后的每个segme
 - 支持`<|endoftext|>`这类特殊token
 - 像GPT2一样先用正则表达式进行pre-tokenization
 
+### Pytorch and resource accounting
+
+***tensor***是基本单元，在pytorch中是指向分配内存的指针，并且存在`metadata`来记录tensor的`size`大小、`storage offset`数据从storage的第几个元素开始、`stride`步长告诉某维度+1需要跳过多少元素
+
+$$ \text{index} = \text{offset} + (\text{行索引} \times \text{行步长}) + (\text{列索引} \times \text{列步长}) $$
+
+对tensor的大部分操作得到的也只是通过**更改部分metadata获得不同view视图**，例如`transpose()`矩阵转置只是交换了原先的`(行步长, 列步长)`到`(列步长, 行步长)`，但是注意`transpose()`以后不能用`view()`，因为view只通过计算新的步长来重新“解释”这块内存，transpose后会出现逻辑和物理上错位，使用`y = x.transpose(1, 0).contiguous().view(2, 3)`可以完全拷贝
+
+#### tensor大小
+
+FP32 -> 1位符号，8位指数，23位分数。在ML，FP32是最大的，也是pytorch中默认的
+
+bfloat16(brain floating point) -> 1位符号，8位指数，7位分数。和FP32一样指数级，和FP16一样内存大小。虽然带来resolution worse，但是这在DeepLearning不太重要
+
+Memory is determined by the **number of values** and **data type of each value**
+
+```python
+x = torch.zeros(4, 8) # 可以torch.zeros(4, 8, dtype=torch.float16/32等进行指定)
+assert x.dtype == torch.float32 # 默认是FP32
+assert x.size() == torch.Size([4, 8])
+assert x.numel() == 4 * 8
+assert x.element_size() == 4 # FP32是4字节
+assert get_memory_usage(x)=x.numel() * x.element_size() == 4 * 8 * 4
+```
+
+#### tensor位置
+
+默认tensor存在CPU，需要手动指定转换到GPU
+
+![image-20251120005751148](./Images/image-20251120005751148.png)
+
+```python
+x = torch.zeros(32, 32)
+assert x.device == torch.device("cpu")
+if not torch.cuda.is_available():
+  return
+num_gpus = torch.cuda.device_count() 
+
+# Move the tensor to GPU memory (device 0)
+y = x.to("cuda:0")
+assert y.device == torch.device("cuda", 0)
+
+# Or create a tensor directly on the GPU
+z = torch.zeros(32, 32, device="cuda:0")
+```
+
+#### einops库
+
+- einsum函数
+
+```python
+x: Float[torch.Tensor, "batch seq1 hidden"] = torch.ones(2, 3, 4)
+y: Float[torch.Tensor, "batch seq2 hidden"] = torch.ones(2, 3, 4)
+# Old way, @表示矩阵相乘，transpose(num1, num2)交换num1列和num2列
+z = x @ y.transpose(-2, -1)  # batch, sequence, sequence
+# Use einops.einsum
+z = einsum(x, y, "batch seq1 hidden, batch seq2 hidden -> batch seq1 seq2")
+# 或者用...表示其他维度
+z = einsum(x, y, "... seq1 hidden, ... seq2 hidden -> ... seq1 seq2")
+```
+
+- reduce函数
+
+```python
+# Old way
+y = x.sum(dim = -1)
+# Use einops.reduce
+y = reduce(x, "... hidden -> ...", "sum")
+```
+
+- rearrange函数
+
+```python
+# total_hidden 实际上等于heads * hidden1
+x: Float[torch.Tensor, "batch seq total_hidden"] = torch.ones(2, 3, 8)
+# 使用einops.rearrange，将total_hidden分开成heads * hidden1
+x = rearrange(x, "... (heads hidden1) -> ... heads hidden1", heads=2)
+x = rearrange(x, "... heads hidden1 -> ... (heads hidden1)")
+```
+
+#### FLOP
+
+浮点数操作
+
+矩阵相乘，`FLOPs = 2 * B * D * K`，每个y的元素都要经过`x[i][j] * w[j][k]`再相加
+
+```python
+x = torch.ones(B, D, device=device)
+w = torch.randn(D, K, device=device)
+y = x @ w
+actual_num_flops = 2 * B * D * K
+```
+
+#### MFU
+
+不考虑通信开销等，Model FLOPs utilization = actual FLOP/s / promised FLOPs
+
+#### Grad
+
+用`torch.tensor([1., 2, 3], requires_grad=True)`开启让PyTorch构建计算图记录，这样在计算`loss.backward()`时，能利用链式法则自动求出梯度
+
+```python
+# 前向传播计算损失
+x = torch.tensor([1., 2, 3])
+w = torch.tensor([1., 1, 1], requires_grad=True)
+pred_y = x @ w
+loss = 0.5 * (pred_y - 5).pow(2)
+# 后项传播利用链式法则计算梯度，只会在leaf Tensor有grad
+loss.backward()
+assert loss.grad is None
+assert pred_y.grad is None
+assert x.grad is None
+assert torch.equal(w.grad, torch.tensor([1, 2, 3]))
+```
+
+B = Batch Size, D = Input Dimension, K = Output Dimension
+
+前向传播的计算量：2 * B * D * K = 2 * Data Points * Parameters
+
+后向传播的计算量：4 * B * D * K 由于计算权重的梯度和输入的梯度共需要两次梯度乘法
+
+#### Model
+
+##### Parameter Initialization
+
+`w = nn.Parameter(input_dim, output_dim)`是Tensor的子类，可以用`w.data`获取tensor
+
+```python
+# 正常的初始化，randn是从均值0、方差1的正态分布取的
+x = nn.Parameter(torch.randn(input_dim))
+w = nn.Parameter(torch.randn(input_dim, output_dim))
+output = x @ w # 把N个方差为1的相加，方差变为N，不稳定，多层以后会blow up!!!
+# 所以除以标准差
+w = nn.Parameter(torch.randn(input_dim, output_dim) / np.sqrt(input_dim))
+```
+
+##### Memory
+
+```python
+num_parameters = (D * D * num_layers) + D
+num_activations = B * D * num_layers
+# 每个参数都要算对应梯度
+num_gradients = num_parameters
+# 对SGD optimizer来说每个参数存一个动量的，如果是Adam则是2 * num_parameters
+num_optimizer_states = num_parameters
+# 假设用float32则4字节
+total_memory = 4 * (num_parameters + num_activations + num_gradients + num_optimizer_states)
+```
+
+##### Mix precision training
+
+可以尝试：在前向传播的activations用`bf16/fp8`，其余的参数/梯度用`fp32`
+
+但是训练模型很难使用低精度，训练后的部署推理用量化成低精度更好
+
 ### Architecture
 
 基础Transformer架构：
 
 ![image-20251118121655336](./Images/image-20251118121655336.png)
+
+Question: How long would it take to train a **70B** parameter model on **15T** tokens on 1024 H100s?
+
+```python
+total_flops = 6 * 70e9 * 15e12
+assert h100_flop_per_sec = 1979e12 / 2
+mfu = 0.5
+flops_per_day = h100_flop_per_sec * mfu * 1024 * 60 * 60 * 24
+days = total_flops / flops_per_day
+```
+
+Question: What's the largest model that can you train on 8 H100s using AdamW(naively)
+
+(activations are not accounted for, depending on batch size and sequence length)
+
+```python
+h100_bytes = 80e9
+# parameters, gradients, optimizer state要保存一阶动量和二阶动量, 都是FP32
+bytes_per_parameter = 4 + 4 + (4 + 4) 
+num_parameters = (h100_bytes * 8) / bytes_per_parameter
+```
+
+
 
 ### <a href="../assignment1-basics">Assignment</a>
 
