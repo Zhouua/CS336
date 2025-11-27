@@ -239,10 +239,6 @@ total_memory = 4 * (num_parameters + num_activations + num_gradients + num_optim
 
 ### Architecture
 
-基础Transformer架构：
-
-![image-20251118121655336](./Images/image-20251118121655336.png)
-
 Question: How long would it take to train a **70B** parameter model on **15T** tokens on 1024 H100s?
 
 ```python
@@ -264,7 +260,223 @@ bytes_per_parameter = 4 + 4 + (4 + 4)
 num_parameters = (h100_bytes * 8) / bytes_per_parameter
 ```
 
+#### Original Transformer
 
+左侧encoder，右侧decoder。GPT 实际上只有Decoder，BERT只有Encoder只能读不能写，原始 Transformer既有 Encoder 又有 Decoder 主要用于翻译和摘要
+
+- Encoder
+  - 负责接收输入，将其转化为向量表示（Embedding），加上位置编码
+  - 包含 *N* 个堆叠层，每层由 **多头注意力机制（Multi-Head Attention）** 和 **前馈神经网络（Feed Forward）** 组成，分别获得和其他token的关系、学习该token的特征
+  - 每个子层周围都有**Add & Norm**残差连接和层归一化，分别
+  - FFN是两层MLP，e.g. 先输入512维，然后放大到2048维，通过ReLU激活，再降维512。先升维能更容易区分低维纠缠的复杂数据，再降维压缩计算。不会丢失精度，因为有Add&Norm确保
+- Decoder
+  - 对正确的Output**右移**开头加上起始符`<bos>`，转为向量，然后进行**带掩码的多头注意力**（在训练时，我们为了并行计算，是一次性把完整的标准答案全都扔进去的，掩码是让第 *i* 个位置，**只能看到i之前的位置**，看不见未来的位置。这保证了生成的因果性）与Add & Norm
+  - 将Encoder的输出分成**Key**和**Value**，结合Decoder的**Query**，进入同Encoder的N个堆叠层
+  - 最后Linear层输出维度等于词表大小，每个维度对应一个词的分数，经过Softmax转换成概率
+
+![image-20251125142145663](./Images/image-20251125142145663.png)
+
+#### Modified Transformer for this lesson
+
+- Decoder-Only结构
+- 使用preNorm前置归一化
+- RoPE旋转位置编码
+- 使用SwiGLU激活函数
+- 线性层去掉bias
+
+![image-20251125142248299](./Images/image-20251125142248299.png)
+
+#### Normalization
+
+##### Pre-norm vs Post-norm
+
+pre-norm将归一化放在FFN部分前面（最近也有Grok等还在FFN后面添加了Layer Norm，Olmo2只用了在FFN后面的Layer Norm而没有FFN前的）
+
+post-norm在“主干道”使用归一化，在反向传播计算梯度时，多个层的Norm除法叠加在一起，很容易造成梯度爆炸或者梯度消失，因此训练时需要warm-up；而pre-norm则主干道只是一个add，不warm-up训练效果也比post-norm好
+
+![image-20251125180729428](./Images/image-20251125180729428.png)
+
+##### LayerNorm vs RMSNorm
+
+- LayerNorm
+
+​					$$ y = \frac{x - \mathbb{E}[x]}{\sqrt{\text{Var}[x] + \epsilon}} * \gamma + \beta $$
+
+- RMSNorm
+
+​					$$ y=\frac{x}{\sqrt{||x||_2^2 + \epsilon}} * \gamma $$
+
+简化，减去了LayerNorm的均值和bias，但是as good as LayerNorm，同时更少计算更少存储。但实际上这省不了多少FLOPS，因为Normalization在整个Transformer算力消耗只占0.17%(矩阵运算占99.80%，逐元素操作占0.03%)，真正上是节省在memory movement上！算mean的时候要读取整个向量算好再写回去，**Normalization是memory-bound算很快读很久(矩阵乘法是compute-bound，读一次算很久)**。
+
+注意：**FLOPs 不等于 Runtime**
+
+![image-20251125224702277](./Images/image-20251125224702277.png)
+
+##### Dropping bias term
+
+- 传统Transformer的FFN
+
+​					$$ FFN(x)=max(0, xW_1+b_1)W_2+b_2 $$
+
+- Most implementations
+
+​					$$ FFN(x)=\sigma(xW_1)W_2 $$
+
+和Normalization一样，同时加了bias往往会造成更不稳定
+
+#### Activations
+
+##### Normal activatations
+
+- ReLU
+
+​					$$y=max(0,x)\ ->\ FF(x)=max(0,xW_1)W_2$$ 
+
+计算快，但是0点不可导，负数区域没梯度
+
+- GeLU
+
+​					$$GELU(x)=x\Phi(x) \ ->\ FF(x)=GELU(xW_1)W_2$$
+
+Φ(*x*)是高斯函数，在0附近平滑，并有一小段负数，处处可导，但是计算开销大
+
+##### Gated activations
+
+传统激活对所有特征要么通过、要么彻底屏蔽；门控使用一个线性乘法项`xV`可以通过学习参数，动态调整哪些被保留
+
+由于额外引入了矩阵V，为保证总参数量相同，通常把`d_ff`缩小到原来的2/3
+
+- ReGLU
+
+entry-wise逐元素乘
+
+​					$$ {FF_{ReGLU}(x)=(max(0,xW_1)\otimes xV)W_2} $$
+
+- GeGLU
+
+​					$$ FFN_{GeGLU}(x,W,V,W_2)=(GELU(xW)\otimes xV)W_2$$
+
+- SwiGLU
+
+swish is `x * sigmoid`
+
+​					$$ FFN_{SwiGLU}(x,W,V,W_2)=(Swish(xW)\otimes xV)W_2 $$
+
+#### Position Embedding
+
+##### Sin embedding
+
+$$ Embed(x,i)=v_x+PE_{pos} \\ PE_{(pos,2i)}=sin(pos/10000^{\frac{2i}{d_{model}} }) \\ PE_{(pos,2i+1)}=cos(pos/10000^{\frac{2i}{d_{model}} })$$
+
+##### Absolute embedding
+
+$$ Embed(x,i)=v_x+u_i $$
+
+用一个可学习的位置向量代表位置关系
+
+##### Relative embedding
+
+不再往 embedding 里加位置，而是直接改**注意力打分**
+
+![image-20251126015009064](./Images/image-20251126015009064.png)
+
+##### Rotary Position Embedding 旋转位置编码
+
+更高维的想法：位置编码应该满足`<f(x, i),f(y, j)> = g(x, y, i - j)`，即**能通过“相对位置 i − j”来获得位置信息**，不关心绝对位置 i 和 j 各是多少。而上述三种都不满足
+
+所以，想象成**旋转和角度**。相对位置就是角度，在位置***n***的只需要进行旋转***nθ***即可。
+
+而二维向量是很好旋转的，多维向量则不是，可以将多维向量拆解成n个二维向量，每个二维向量每次有不同的旋转角度，这样可以确保有些转的快、有些转的慢，转的快代表位置敏感捕捉**近距离**的细微位置差异，转的慢让模型感知到**远距离**的位置关系，防止在长序列中位置信息“重复”或“混淆”
+
+所以，最终只需乘下面这个矩阵：
+
+![image-20251126114254363](./Images/image-20251126114254363.png)
+
+传统的位置编码都是在最开始的embedding层加一次注意力编码，而RoPE则是每次在Attention计算前对Q和K进行旋转，强制每一层的注意力机制都必须明确地感知到“相对位置”
+
+θ是在一开始就固定的，同sin embedding一样的计算方式，是用`base`和`head_dim`这两个超参数计算出来的，并且每个注意力层的θ是一样的：
+
+​									$$ \theta_i=base^{-\frac{2i}{d_{head}}}$$
+
+#### Hyperparameter	
+
+##### d_model与d_ff
+
+- 默认情况下$$ d_{ff} = 4d_{model} $$，如果使用了门控激活函数则$$d_{ff}^{\ '} = \frac{2}{3}d_{ff} = \frac{8}{3}d_{model} $$
+- 但是诸如T5使用$$d_{ff}=64d_{model}$$，同样work。只要$$ \frac{d_{ff}}{d_{model}} \in [0,10] $$都是sub-optimal的
+
+##### 注意力头数
+
+- 即使我们计算了 h个注意力头，计算成本并没有显著增加。因为多头注意力是将原先的输入乘查询矩阵($$XQ \in \mathbb{R}^{n*d}$$) reshape 到$$ \mathbb{R}^{n*h*\frac{d}{h}} $$，n是序列长度、d是模型维度、h是头的数量、d/h是每个头的维度。将大维度矩阵拆成多个小维度，矩阵总大小是一样的，计算量和参数量基本不变
+
+- 默认情况下$$ Head_{dim}×Num_{heads} = Model_{dim} $$
+- 但是诸如T5也可以使用$$ Head_{dim}×Num_{heads} > Model_{dim} $$，这会额外要求一个先升维再降维的过程
+
+##### aspect ratio
+
+$$aspect\ ratio = d_{model}/n_{layer}$$ 询问的是模型更宽`d_model`还是更深`n_layer`
+
+- **极深的模型更难并行化，且具有更高的延迟。**相比之下，增加**宽度**（把矩阵变大）是非常容易并行化的。因为深度神经网络第 2 层的计算必须等待第 1 层算完才能开始；第 3 层必须等第 2 层……层层递进
+
+##### regularization
+
+在pre-training部分真的要正则化吗？以前数据集很小，需要dropout等，现在pre-training数据很多，所以只会训1个epoch，是否只要min los就行？
+
+- 目前很多模型都将dropout从0.1设置成了0，即从每次前向计算随机10%神经元被屏蔽到不再屏蔽
+- 仍然保留着weight decay为0.1，即模型为了拟合数据会把权重变得很大造成过拟合，weight decay用$$\lambda$$表示，在更新权重时，从原来的$$ w_{new} = w_{old} - (lr \times 梯度) $$)变成$$ w_{new} = w_{old} - (lr \times \text{梯度}) - (lr \times \lambda \times w_{old}) $$
+  - 但是根据下图，weight decay从原先为了过拟合，变成是为了**优化器更好降低training loss**
+
+![image-20251127120735375](./Images/image-20251127120735375.png)
+
+#### Stability tricks - Softmax
+
+![image-20251127123847280](./Images/image-20251127123847280.png)
+
+Softmax，是导致不稳定的主要原因之一，因为使用了指数可能造成截断溢出，使用了除法可能导致梯度爆炸
+
+存在于**模型最后一层输出**和**自注意力机制**当中
+
+$$ P(x) = \frac{e^{U(x)}}{Z(x)},\ \text{U(x)为原始打分,\ Z(x)为所有打分指数和} $$
+
+$$ L = \sum_{i}logP(x_i)$$
+
+- 对于模型最后一层的softmax，使用**Z-loss**
+  - $$log(P(x))=U_r(x)-log(Z(x))$$，竭力让`log(Z(x))`=0，那么在要最大化的对数似然`L`减去惩罚项，变成$$L=\sum_{i}[logP(x_i)-\alpha(log(Z(x_i))-0)^2]$$
+- 对于自注意力机制中，使用**QK norm**
+  - 标准自注意力机制中，`Scores = Q @ K.T`，随着层数加深和维度增大，Q/K可能很大，Scores出现极端值输入Softmax造成不稳定，QK norm在Q和K计算Scores之前进行归一化
+
+![image-20251127131323310](./Images/image-20251127131323310.png)
+
+- 也可以使用一个Soft-capping来限定最大值，但是使用tanh更耗时，且牺牲部分性能
+  - $$logits_{new} = soft\_cap * tanh(logits_{old}/soft\_cap)$$
+
+#### Attention Heads
+
+![image-20251127133726382](./Images/image-20251127133726382.png)
+
+制约瓶颈的是**内存读写**。`Arithmetic intensity = FLOPs / 内存访问量`，越高意味着每从显存读一点数据进来，可以做很多计算
+
+如果使用`KV cache`，节省了中间的计算(仍然要矩阵乘法b)，但是要频繁的读写中间的KV矩阵。所以，使用KV cache: 
+
+​				$$ FLOPs=bnd^2,memory\ access=bn^2d+nd^2\\Arithmetic\ intensity=O((\frac{n}{d}+\frac{1}{b})^{-1})$$
+
+这不好，因为要想变小，需要序列长度n小或者模型维度d大
+
+##### Multi-Query Attention
+
+还是保留很多 **Query 头**，这样模型还能从多个角度看上下文。但 Key 和 Value 不再按头复制很多份，而是**所有头共用一套 K/V**
+
+
+
+![image-20251127144955793](./Images/image-20251127144955793.png)
+
+最近出现Group-Query Attention。Multi-head的value : key : query=1 : 1 : 1，MQA是1 : 1 : n，GQA是m : m : n
+
+##### Others
+
+- sparse attention
+- sliding window attention
+- full attention与LR attention结合
 
 ### <a href="../assignment1-basics">Assignment</a>
 
