@@ -4,6 +4,7 @@ import os
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
+import cs336_basics
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
@@ -561,7 +562,7 @@ def get_tokenizer(
     """
     raise NotImplementedError
 
-
+from cs336_basics import my_train_bpe
 def run_train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
@@ -589,4 +590,4 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    return my_train_bpe.train_bpe(input_path, vocab_size, special_tokens)
